@@ -1,0 +1,44 @@
+[package]
+name = "hll-node"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Self-contained distributed HyperLogLog engine (chitchat gossip + rendezvous hashing + gRPC)"
+license = "MIT"
+
+[lib]
+name = "hll_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hll-node"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+arc-swap = "1.7"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+chitchat = "0.14"
+dashmap = "6"
+futures = "0.3"
+prometheus = { version = "0.14", default-features = false }
+prost = "0.14"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tonic = { version = "0.14", features = ["transport", "codegen"] }
+tonic-prost = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zstd = { version = "0.13", default-features = false }
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+rand = "0.9"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

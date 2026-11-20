@@ -1,0 +1,99 @@
+syntax = "proto3";
+package hll.v1;
+
+// Wire protocol for the distributed HLL engine.
+//
+// This is the spec's `hll.proto` with backwards-compatible additions (new field
+// numbers / new RPCs only):
+//   * AddRequest.items            raw items, hashed server-side with xxh3_64
+//   * DeleteRequest.internal      primary -> replica fan-out (no re-forwarding)
+//   * PushSnapshotRequest.encoding  dense / dense+zstd / sparse payloads
+//   * GetSnapshot RPC             used by the MergeInto coordinator
+//   * CountRequest.allow_local    per-request opt-in to replica-local reads
+service HllService {
+  // Client-facing & forwarded operations
+  rpc Add(AddRequest) returns (AddResponse);
+  rpc Count(CountRequest) returns (CountResponse);
+  rpc MergeInto(MergeIntoRequest) returns (MergeIntoResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // Internal peer-to-peer replication & handoff
+  rpc ReplicateDelta(ReplicateDeltaRequest) returns (Ack);
+  rpc PushSnapshot(PushSnapshotRequest) returns (Ack);
+  rpc GetSnapshot(GetSnapshotRequest) returns (GetSnapshotResponse);
+}
+
+message AddRequest {
+  string hll_id = 1;
+  repeated uint64 item_hashes = 2; // Pre-hashed 64-bit items
+  uint32 ttl_seconds = 3;
+  uint32 hop_count = 4;            // Loop prevention: 0 = client, 1 = forwarded
+  repeated bytes items = 5;        // Raw items (hashed server-side with xxh3_64)
+}
+
+message AddResponse {
+  bool modified = 1;
+}
+
+message CountRequest {
+  string hll_id = 1;
+  uint32 hop_count = 2;
+  bool allow_local = 3; // Serve from a local replica if this node is an owner
+}
+
+message CountResponse {
+  uint64 cardinality = 1;
+  bool exists = 2;
+}
+
+message MergeIntoRequest {
+  string dest_hll_id = 1;
+  repeated string source_hll_ids = 2;
+}
+
+message MergeIntoResponse {
+  uint64 cardinality = 1;
+}
+
+message DeleteRequest {
+  string hll_id = 1;
+  uint32 hop_count = 2;
+  bool internal = 3; // Set by the primary when fanning out to replicas
+}
+
+message DeleteResponse {
+  bool deleted = 1;
+}
+
+message ReplicateDeltaRequest {
+  string hll_id = 1;
+  repeated uint64 item_hashes = 2;
+  uint32 ttl_seconds = 3;
+}
+
+enum SnapshotEncoding {
+  DENSE_RAW = 0;   // registers = [u8; m]
+  DENSE_ZSTD = 1;  // registers = zstd([u8; m])
+  SPARSE = 2;      // registers = little-endian u32 list of (idx << 6 | rho)
+}
+
+message PushSnapshotRequest {
+  string hll_id = 1;
+  uint32 precision = 2;
+  bytes registers = 3;
+  uint64 expires_at_unix = 4; // 0 = no expiry
+  SnapshotEncoding encoding = 5;
+}
+
+message GetSnapshotRequest {
+  string hll_id = 1;
+}
+
+message GetSnapshotResponse {
+  bool exists = 1;
+  PushSnapshotRequest snapshot = 2;
+}
+
+message Ack {
+  bool ok = 1;
+}

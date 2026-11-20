@@ -1,0 +1,261 @@
+# hll-node on AWS EKS: Namespace, RBAC (AZ discovery), headless mesh Service,
+# client Service, PDB, StatefulSet, NetworkPolicy.
+#
+#   kubectl apply -f deploy/hll-node.yaml
+#
+# Replace <account-id>/<region> in the image reference first.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hll-system
+---
+# 0. RBAC: the init container reads its node's topology.kubernetes.io/zone
+#    label so the node can gossip `az` for AZ-aware replica placement.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hll-node
+  namespace: hll-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hll-node-read-nodes
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hll-node-read-nodes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hll-node-read-nodes
+subjects:
+  - kind: ServiceAccount
+    name: hll-node
+    namespace: hll-system
+---
+# 1. Headless Service for Chitchat Seed Discovery & Direct Pod DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: hll-mesh
+  namespace: hll-system
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true # seeds must resolve before pods are Ready
+  selector:
+    app: hll-node
+  ports:
+    - name: gossip
+      port: 7280
+      protocol: UDP
+    - name: grpc
+      port: 8080
+      protocol: TCP
+---
+# 2. Client-Facing Service (any pod accepts any request and routes it in <= 1 hop)
+apiVersion: v1
+kind: Service
+metadata:
+  name: hll-api
+  namespace: hll-system
+spec:
+  type: ClusterIP
+  selector:
+    app: hll-node
+  ports:
+    - name: grpc
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+---
+# 3. PodDisruptionBudget: never lose more than 1 pod simultaneously (protects R=2)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hll-node-pdb
+  namespace: hll-system
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: hll-node
+---
+# 4. StatefulSet: stable POD_NAMEs for Rendezvous Hashing + AZ spreading
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hll-node
+  namespace: hll-system
+spec:
+  serviceName: hll-mesh
+  replicas: 3
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: hll-node
+  template:
+    metadata:
+      labels:
+        app: hll-node
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: hll-node
+      terminationGracePeriodSeconds: 60 # time for state drain handoff
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: hll-node
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: hll-node
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      volumes:
+        - name: topology
+          emptyDir: {}
+      initContainers:
+        # Best effort: an empty file simply disables AZ-aware placement.
+        - name: discover-az
+          image: public.ecr.aws/bitnami/kubectl:1.31
+          command:
+            - sh
+            - -c
+            - >
+              kubectl get node "$NODE_NAME"
+              -o jsonpath='{.metadata.labels.topology\.kubernetes\.io/zone}'
+              > /etc/hll/az || true; echo "az=$(cat /etc/hll/az)"
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: topology
+              mountPath: /etc/hll
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+      containers:
+        - name: hll-node
+          image: <account-id>.dkr.ecr.<region>.amazonaws.com/hll-node:v1.0.0
+          ports:
+            - name: gossip
+              containerPort: 7280
+              protocol: UDP
+            - name: grpc
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: CLUSTER_ID
+              value: "eks-hll-prod"
+            - name: REPLICATION_FACTOR
+              value: "2"
+            - name: REPLICATION_MODE
+              value: "async" # or "sync" for strict durability
+            - name: HLL_PRECISION
+              value: "14"
+            - name: MAX_MEMORY_BYTES
+              value: "3435973836" # ~3.2 GiB soft cap (80% of 4Gi limit)
+            - name: SEED_NODES
+              value: "hll-node-0.hll-mesh.hll-system.svc.cluster.local:7280,hll-node-1.hll-mesh.hll-system.svc.cluster.local:7280,hll-node-2.hll-mesh.hll-system.svc.cluster.local:7280"
+            - name: AZ_FILE
+              value: "/etc/hll/az"
+            - name: MIN_QUORUM
+              value: "2"
+            - name: GOSSIP_INTERVAL_MS
+              value: "500"
+            - name: PHI_THRESHOLD
+              value: "8.0"
+            - name: DRAIN_WAIT_MS
+              value: "2000"
+            - name: RUST_LOG
+              value: "info,chitchat=warn"
+          volumeMounts:
+            - name: topology
+              mountPath: /etc/hll
+              readOnly: true
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "4Gi"
+            limits:
+              cpu: "2000m"
+              memory: "4Gi" # requests == limits for memory avoids memory-pressure eviction
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9090
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 9090
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+# 5. NetworkPolicy (enforced by the AWS VPC CNI network-policy agent or Cilium)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hll-node-netpol
+  namespace: hll-system
+spec:
+  podSelector:
+    matchLabels:
+      app: hll-node
+  policyTypes:
+    - Ingress
+  ingress:
+    # Chitchat UDP gossip only between hll-node pods
+    - from:
+        - podSelector:
+            matchLabels:
+              app: hll-node
+      ports:
+        - protocol: UDP
+          port: 7280
+    # gRPC data plane from clients & peers
+    - ports:
+        - protocol: TCP
+          port: 8080
+    # Health probes + Prometheus scraping
+    - ports:
+        - protocol: TCP
+          port: 9090
