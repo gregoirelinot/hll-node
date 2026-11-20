@@ -348,8 +348,9 @@ impl Hll {
                 }
                 let mut entries = Vec::with_capacity(bytes.len() / 4);
                 let mut prev: Option<u32> = None;
-                for chunk in bytes.chunks_exact(4) {
-                    let e = u32::from_le_bytes(chunk.try_into().unwrap());
+                let (chunks, _) = bytes.as_chunks::<4>();
+                for chunk in chunks {
+                    let e = u32::from_le_bytes(*chunk);
                     let idx = entry_idx(e);
                     let rho = entry_rho(e);
                     if idx as usize >= m || rho == 0 || rho > max_rho {
