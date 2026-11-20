@@ -39,6 +39,21 @@ fn test_config(name: &str, seed: Option<u16>) -> (Config, u16) {
     (c, gossip)
 }
 
+/// Free-port probing races with other tests running in parallel; retry
+/// with fresh ports if a bind fails.
+async fn start_with_retry(name: &str, seed: Option<u16>, tweak: &dyn Fn(&mut Config)) -> NodeHandle {
+    let mut last_err = None;
+    for _ in 0..10 {
+        let (mut cfg, _) = test_config(name, seed);
+        tweak(&mut cfg);
+        match hll_node::start(cfg).await {
+            Ok(h) => return h,
+            Err(e) => last_err = Some(e),
+        }
+    }
+    panic!("start node {name}: {:?}", last_err);
+}
+
 async fn wait_until<F, Fut>(what: &str, timeout: Duration, mut f: F)
 where
     F: FnMut() -> Fut,
@@ -70,12 +85,15 @@ impl Cluster {
     }
 
     async fn add_node(&mut self, i: usize) {
+        self.add_node_with(i, |_| {}).await;
+    }
+
+    async fn add_node_with(&mut self, i: usize, tweak: impl Fn(&mut Config)) {
         let seed = (i > 0).then_some(self.seed_port);
-        let (cfg, gossip) = test_config(&format!("hll-node-{i}"), seed);
+        let h = start_with_retry(&format!("hll-node-{i}"), seed, &tweak).await;
         if i == 0 {
-            self.seed_port = gossip;
+            self.seed_port = h.node.cfg.gossip_port;
         }
-        let h = hll_node::start(cfg).await.expect("start node");
         if self.nodes.len() <= i {
             self.nodes.resize_with(i + 1, || None);
         }
@@ -559,13 +577,9 @@ async fn rolling_restart_same_name_rejoin() {
 async fn sync_replication_mode() {
     let mut cluster = Cluster { nodes: Vec::new(), seed_port: 0 };
     for i in 0..3 {
-        let seed = (i > 0).then_some(cluster.seed_port);
-        let (mut cfg, gossip) = test_config(&format!("hll-node-{i}"), seed);
-        cfg.replication_mode = hll_node::config::ReplicationMode::Sync;
-        if i == 0 {
-            cluster.seed_port = gossip;
-        }
-        cluster.nodes.push(Some(hll_node::start(cfg).await.unwrap()));
+        cluster
+            .add_node_with(i, |c| c.replication_mode = hll_node::config::ReplicationMode::Sync)
+            .await;
     }
     cluster.wait_active(3).await;
     let mut c = cluster.client(0).await;
